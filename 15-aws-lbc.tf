@@ -42,22 +42,22 @@ resource "helm_release" "aws_lbc" {
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
   namespace  = "kube-system"
-  version    = "1.8.1"
+  version    = "3.5.0"
 
-  set {
-    name  = "clusterName"
-    value = aws_eks_cluster.eks.name
-  }
-
-  set {
-    name  = "serviceAccount.name"
-    value = "aws-load-balancer-controller"
-  }
-
-  set {
-    name  = "vpcId"
-    value = aws_vpc.main.id
-  }
+  set = [
+    {
+      name  = "clusterName"
+      value = aws_eks_cluster.eks.name
+    },
+    {
+      name  = "serviceAccount.name"
+      value = "aws-load-balancer-controller"
+    },
+    {
+      name  = "vpcId"
+      value = aws_vpc.main.id
+    },
+  ]
 
   depends_on = [helm_release.cluster_autoscaler]
 }

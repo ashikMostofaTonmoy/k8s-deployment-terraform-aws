@@ -58,12 +58,16 @@ resource "aws_eks_pod_identity_association" "ebs_csi_driver" {
 }
 
 resource "aws_eks_addon" "ebs_csi_driver" {
-  cluster_name             = aws_eks_cluster.eks.name
-  addon_name               = "aws-ebs-csi-driver"
-  addon_version            = "v1.47.0-eksbuild.1"
-  service_account_role_arn = aws_iam_role.ebs_csi_driver.arn
+  cluster_name = aws_eks_cluster.eks.name
+  addon_name   = "aws-ebs-csi-driver"
 
-  depends_on = [aws_eks_node_group.general]
+  # No service_account_role_arn: credentials come from the Pod Identity
+  # association above. No addon_version: EKS picks the default build for
+  # local.eks_version (v1.47.0-eksbuild.1 was never published for 1.36).
+  depends_on = [
+    aws_eks_pod_identity_association.ebs_csi_driver,
+    aws_eks_addon.pod_identity,
+  ]
 }
 
 resource "kubernetes_storage_class_v1" "gp3" {

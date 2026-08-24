@@ -56,35 +56,24 @@ resource "helm_release" "efs_csi_driver" {
   repository = "https://kubernetes-sigs.github.io/aws-efs-csi-driver/"
   chart      = "aws-efs-csi-driver"
   namespace  = "kube-system"
-  version    = "3.0.5"
+  version    = "4.4.2"
 
-  set {
-    name  = "controller.serviceAccount.name"
-    value = "efs-csi-controller-sa"
-  }
-
-  set {
-    name  = "controller.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
-    value = aws_iam_role.efs_csi_driver.arn
-  }
+  set = [
+    {
+      name  = "controller.serviceAccount.name"
+      value = "efs-csi-controller-sa"
+    },
+    {
+      name  = "controller.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+      value = aws_iam_role.efs_csi_driver.arn
+    },
+  ]
 
   depends_on = [
     aws_efs_mount_target.zone_a,
     aws_efs_mount_target.zone_b
   ]
 }
-
-# Optional since we already init helm provider (just to make it self contained)
-data "aws_eks_cluster" "eks_v2" {
-  name = aws_eks_cluster.eks.name
-}
-
-# Optional since we already init helm provider (just to make it self contained)
-data "aws_eks_cluster_auth" "eks_v2" {
-  name = aws_eks_cluster.eks.name
-}
-
-
 
 resource "kubernetes_storage_class_v1" "efs" {
   metadata {

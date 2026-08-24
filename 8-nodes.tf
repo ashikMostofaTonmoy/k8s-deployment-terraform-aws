@@ -1,35 +1,29 @@
 resource "aws_iam_role" "nodes" {
   name = "${local.env}-${local.eks_name}-eks-nodes"
 
-  assume_role_policy = <<POLICY
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "sts:AssumeRole",
-      "Principal": {
-        "Service": "ec2.amazonaws.com"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect    = "Allow"
+        Action    = "sts:AssumeRole"
+        Principal = { Service = "ec2.amazonaws.com" }
       }
-    }
-  ]
-}
-POLICY
+    ]
+  })
 }
 
-# This policy now includes AssumeRoleForPodIdentity for the Pod Identity Agent
-resource "aws_iam_role_policy_attachment" "amazon_eks_worker_node_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.nodes.name
-}
+resource "aws_iam_role_policy_attachment" "nodes" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+    # Lets you open a shell on a node with `aws ssm start-session` instead of
+    # running a bastion host. Invaluable when nodes fail to join.
+    "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+  ])
 
-resource "aws_iam_role_policy_attachment" "amazon_eks_cni_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.nodes.name
-}
-
-resource "aws_iam_role_policy_attachment" "amazon_ec2_container_registry_read_only" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+  policy_arn = each.value
   role       = aws_iam_role.nodes.name
 }
 
@@ -44,13 +38,26 @@ resource "aws_eks_node_group" "general" {
     aws_subnet.private_zone2.id
   ]
 
-  # capacity_type  = "ON_DEMAND"
-  # instance_types = ["t3a.large"] # Specify multiple instance types for flexibility
+  # AL2 EKS AMIs stopped being published on 2025-11-26, so every node group is
+  # AL2023 now. AL2023 needs a Nitro instance (ENA + NVMe): previous-generation
+  # Xen types such as t2.* boot but never join the cluster.
+  ami_type = "AL2023_x86_64_STANDARD"
 
-  capacity_type  = "SPOT"         # Use SPOT instances
-  instance_types = ["t3a.xlarge"] # Specify multiple instance types for flexibility
+  # EXACTLY ONE instance type. More than one makes EKS build the ASG with a
+  # MixedInstancesPolicy, which launches via the EC2 Fleet API (CreateFleet)
+  # instead of RunInstances -- and this account is capped there
+  # ("You've reached your quota for maximum Fleet Requests for this account").
+  # Nitro is also mandatory: AL2023 is the only AMI family left and it needs
+  # ENA + NVMe, so previous-generation Xen types such as t2.* never join.
+  capacity_type  = "ON_DEMAND"
+  instance_types = ["t3a.large"]
 
-  disk_size = 100 # Set disk size for the nodes
+  # Spot needs several types to be useful, so it stays blocked until the Fleet
+  # Requests limit is raised.
+  # capacity_type  = "SPOT"
+  # instance_types = ["t3a.large", "t3.large", "m6a.large", "m5.large"]
+
+  disk_size = 100
 
   scaling_config {
     desired_size = 2
@@ -66,56 +73,23 @@ resource "aws_eks_node_group" "general" {
     role = "general"
   }
 
+  tags = {
+    Name = "${local.env}-${local.eks_name}-general"
+  }
+
   depends_on = [
-    aws_iam_role_policy_attachment.amazon_eks_worker_node_policy,
-    aws_iam_role_policy_attachment.amazon_eks_cni_policy,
-    aws_iam_role_policy_attachment.amazon_ec2_container_registry_read_only,
+    aws_iam_role_policy_attachment.nodes,
+    # Nodes report NotReady until the CNI is present.
+    aws_eks_addon.vpc_cni,
+    aws_eks_addon.kube_proxy,
   ]
 
-  # Allow external changes without Terraform plan difference
+  # Allow external changes (cluster-autoscaler) without a plan difference
   lifecycle {
     ignore_changes = [scaling_config[0].desired_size]
   }
 }
 
-# resource "aws_eks_node_group" "spot" {
-#   cluster_name    = aws_eks_cluster.eks.name
-#   version         = local.eks_version
-#   node_group_name = "spot"
-#   node_role_arn   = aws_iam_role.nodes.arn
-
-#   subnet_ids = [
-#     aws_subnet.private_zone1.id,
-#     aws_subnet.private_zone2.id
-#   ]
-
-#   capacity_type  = "SPOT"                        # Use SPOT instances
-#   instance_types = ["t3a.xlarge", "t3a.2xlarge"] # Specify multiple instance types for flexibility
-
-#   disk_size = 100 # Set disk size for the nodes
-
-#   scaling_config {
-#     desired_size = 2
-#     max_size     = 10
-#     min_size     = 0
-#   }
-
-#   update_config {
-#     max_unavailable = 1
-#   }
-
-#   labels = {
-#     role = "spot"
-#   }
-
-#   depends_on = [
-#     aws_iam_role_policy_attachment.amazon_eks_worker_node_policy,
-#     aws_iam_role_policy_attachment.amazon_eks_cni_policy,
-#     aws_iam_role_policy_attachment.amazon_ec2_container_registry_read_only,
-#   ]
-
-#   # Allow external changes without Terraform plan difference
-#   lifecycle {
-#     ignore_changes = [scaling_config[0].desired_size]
-#   }
-# }
+# NOTE: no aws_eks_access_entry for the node role. EKS creates the EC2_LINUX
+# access entry for a managed node group's role by itself; declaring it here
+# races with that and fails with ResourceInUseException.
