@@ -574,15 +574,49 @@ A reasonable order: remote state → restrict API access → HTTPS → least-pri
 
 ## 10. Cleanup
 
+Order matters. The AWS Load Balancer Controller creates load balancers, target groups and security groups *inside your VPC* that Terraform does not know about. If the cluster is destroyed first, those are orphaned and the VPC cannot be deleted. So: delete what makes load balancers first, wait, then destroy.
+
 ```bash
-kubectl delete -f examples/                              # removes the demo and its load balancers
-terraform destroy -target=helm_release.external_nginx    # releases the NLB
+# 1. delete everything that owns a load balancer (the demo, any of your own Services/Ingresses/Gateways)
+kubectl delete -f examples/ --wait=true
+
+# 2. release the ingress NLB (this also removes cert-manager, which depends on it)
+terraform destroy -target=helm_release.external_nginx
+
+# 3. check the load balancers are really gone (empty output = good)
+aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerName' --output text
+
+# 4. destroy the rest (~10-15 min)
 terraform destroy
 ```
 
-If destroy fails on the VPC, look in *EC2 → Load Balancers*, *EC2 → Network Interfaces* and *EC2 → Security Groups* for leftovers named `k8s-…` and delete them, then run `terraform destroy` again. If you created access keys for the demo users, delete them first (`aws iam delete-access-key`), or destroying the IAM users fails.
+If you created access keys for the demo users, delete them first (`aws iam delete-access-key`), or destroying the IAM users fails. Node groups can take several minutes to drain and delete; that is normal.
 
-**Console:** delete the load balancers; then *EC2 → Auto Scaling groups* (set desired capacity to 0, then delete); then the EKS node group and cluster; then the VPC (release the NAT gateway and its Elastic IP first, then *VPC → Delete VPC*, which removes subnets, route tables and the internet gateway); finally the IAM roles, groups and users.
+### Check that nothing is left billing
+
+```bash
+R="--region ap-south-1"      # your region
+aws eks list-clusters $R
+aws ec2 describe-instances $R --filters Name=instance-state-name,Values=pending,running --query 'Reservations[].Instances[].InstanceId'
+aws ec2 describe-nat-gateways $R --filter Name=state,Values=available --query 'NatGateways[].NatGatewayId'
+aws elbv2 describe-load-balancers $R --query 'LoadBalancers[].LoadBalancerName'
+aws ec2 describe-addresses $R --query 'Addresses[].PublicIp'          # unattached Elastic IPs bill
+aws efs describe-file-systems $R --query 'FileSystems[].FileSystemId'
+aws ec2 describe-volumes $R --query 'Volumes[].VolumeId'              # leftover EBS volumes from PVCs
+```
+
+All of them should return empty lists. Also delete the stale kubeconfig entry: `kubectl config delete-context development-demo`.
+
+### If destroy fails
+
+| Error / symptom | Fix |
+|---|---|
+| `DependencyViolation` on a subnet, security group or VPC | A load balancer or its network interface is left over. Look in *EC2 → Load Balancers*, *Network Interfaces* and *Security Groups* for names starting `k8s-`, delete them, run `terraform destroy` again. |
+| `Cluster has nodegroups attached` | A node group is still deleting. Wait (check *EKS → Compute*), then run `terraform destroy` again. |
+| IAM user cannot be deleted | It still has access keys: delete them, retry. |
+| Helm release errors because the cluster is already gone | `terraform state rm helm_release.<name>` for the leftover releases, then retry. |
+
+**Console:** delete the load balancers (*EC2 → Load Balancers*); then *EC2 → Auto Scaling groups* (set desired capacity to 0, then delete) and any EKS node groups; then the EKS cluster; then the VPC (release the NAT gateway first, wait until it is *Deleted*, release its Elastic IP, then *VPC → Delete VPC*, which removes subnets, route tables and the internet gateway); then EFS, and finally the IAM roles, groups and users.
 
 ## License
 
