@@ -78,7 +78,7 @@ Key ideas, in plain words:
 | Control plane | EKS cluster (API auth mode), IAM role, CloudWatch log group (14-day retention) | `7-eks.tf` |
 | Core add-ons | `vpc-cni`, `kube-proxy`, `coredns` (EKS add-ons) | `7a-core-addons.tf` |
 | Nodes | Launch template + Auto Scaling group (2 x `t3a.large`, Amazon Linux 2023), access entry, instance profile | `8-nodes.tf` |
-| Access | IAM user `demo-developer` (group `my-viewer`), IAM user `manager` + role (group `my-admin`) | `9-`, `10-` |
+| Access | IAM groups → IAM roles → EKS access policies (newer, default); IAM users → Kubernetes groups (older, `access_model = "legacy"`) | `11-` (newer); `9-`, `10-` (older) |
 | Platform | Metrics Server, Pod Identity Agent, Cluster Autoscaler | `12-`, `13-`, `14-` |
 | Traffic | AWS Load Balancer Controller, ingress-nginx (NLB), Gateway API CRDs, cert-manager | `15-` .. `17-`, `21-` |
 | Storage | EBS CSI add-on + `gp3` default class, EFS + CSI driver + `efs` class, OIDC provider | `18-` .. `20-` |
@@ -216,21 +216,80 @@ Build the same stack by hand, in this order. Keep the region selector (top right
 
 ## 2. Access for people
 
-Terraform creates two example identities (`9-add-developer-user.tf`, `10-add-manager-role.tf`):
+Two access models ship in this repo. Pick one with `access_model` (default `groups`):
+
+```bash
+terraform apply                              # newer process (default)
+terraform apply -var access_model=legacy     # older process
+```
+
+Switching models destroys one set of users/roles/entries and creates the other, so choose before you hand out credentials.
+
+### Newer process (recommended): IAM group → IAM role → EKS access policy
+
+File: `11-access-groups.tf`.
+
+```mermaid
+flowchart LR
+    u["IAM user<br/>demo-viewer"] -->|member of| g["IAM group<br/>...-viewers"]
+    g -->|"allowed: sts:AssumeRole"| r["IAM role<br/>...-cluster-viewer"]
+    r -->|access entry| p["EKS access policy<br/>AmazonEKSViewPolicy"]
+```
+
+- Two roles (`cluster-viewer`, `cluster-admin`), each with **one** access entry. People never get an entry of their own.
+- Permissions come from EKS **access policies** (`AmazonEKSViewPolicy`, `AmazonEKSClusterAdminPolicy`). No Kubernetes groups and **no RBAC bindings are needed**.
+- The role's own AWS permission is only `eks:DescribeCluster` (enough to build a kubeconfig); everything inside the cluster is decided by the access policy.
+- **Grant access:** add the IAM user to the group (the `eks_viewer_users` / `eks_admin_users` variables, or `aws iam add-user-to-group`).
+- **Revoke access:** remove the user from the group. New logins are refused at once; a role session they already hold stays valid until it expires (`max_session_duration`, 1 hour here).
+- Scope narrower than the whole cluster by changing `access_scope` in `11-access-groups.tf` to `type = "namespace"` with `namespaces = ["dev"]`.
+
+Log in as a user:
+
+```bash
+# 1. as an admin, create a key for the user (demo-viewer / demo-admin)
+aws iam create-access-key --user-name demo-viewer
+
+# 2. in ~/.aws/credentials and ~/.aws/config add:
+#    [profile viewer-user]  -> the keys
+#    [profile viewer]
+#    role_arn       = arn:aws:iam::<account-id>:role/development-demo-cluster-viewer
+#    source_profile = viewer-user
+
+# 3. build a kubeconfig and use it
+aws eks update-kubeconfig --name development-demo --region ap-south-1 --profile viewer --alias viewer
+kubectl --context viewer get pods -A                          # allowed
+kubectl --context viewer create deployment x --image=nginx    # forbidden
+```
+
+The role ARNs are in `terraform output cluster_access_roles`.
+
+Tested on this cluster: the viewer could list pods but got `forbidden` creating a deployment; the admin could create and delete it; after removing the viewer from its group, a new `AssumeRole` failed with `AccessDenied`.
+
+**Console:**
+
+1. *IAM → Roles → Create role → AWS account → This account*, name `development-demo-cluster-viewer`. Add an inline policy allowing `eks:DescribeCluster` on the cluster. Repeat for `...-cluster-admin`.
+2. *EKS → cluster → Access → IAM access entries → Create access entry*: principal = the role, type *Standard*, no Kubernetes groups. On the next page add the access policy `AmazonEKSViewPolicy` (or `AmazonEKSClusterAdminPolicy`) with scope *Cluster* or chosen namespaces.
+3. *IAM → User groups → Create group* (`...-viewers`), then *Permissions → Create inline policy*: allow `sts:AssumeRole` on that role's ARN.
+4. *IAM → Users → Create user*, add to the group. Create an access key under *Security credentials*.
+5. To revoke: *IAM → User groups → group → Users → select → Remove*.
+
+### Older process (legacy): IAM users mapped to Kubernetes groups
+
+Files: `9-add-developer-user.tf`, `10-add-manager-role.tf`. Use with `-var access_model=legacy`. It still works, but it is harder to manage: each person needs their own access entry, and permissions live in Kubernetes RBAC objects you maintain by hand.
+
+Terraform creates:
 
 - **`demo-developer`** (IAM user) is mapped to Kubernetes group `my-viewer`.
 - **`manager`** (IAM user) may assume role `development-demo-eks-admin`, which is mapped to group `my-admin`. The user is also mapped directly, for temporary access.
 
-An access entry only says *who* someone is. What they may *do* comes from Kubernetes RBAC, and **this repo does not ship RBAC bindings**. Until you create them, both groups can log in but are denied everything:
+An access entry only says *who* someone is. What they may *do* comes from Kubernetes RBAC, and **this repo does not ship RBAC bindings**. Until you create them, both groups can log in but are denied everything. A "group" here is just a label string on the identity; Kubernetes has no group objects to create, so the binding is all that is needed:
 
 ```bash
 kubectl create clusterrolebinding my-viewer --clusterrole=view          --group=my-viewer
 kubectl create clusterrolebinding my-admin  --clusterrole=cluster-admin --group=my-admin
 ```
 
-Alternative with no RBAC: drop `kubernetes_groups` and attach an EKS **access policy** (`AmazonEKSViewPolicy` or `AmazonEKSClusterAdminPolicy`) to the entry. This works only for `STANDARD` entries (people, tools), not the node role's `EC2_LINUX` entry.
-
-### Log in as each user
+Log in as a legacy user:
 
 ```bash
 # 1. as an admin, create access keys
@@ -250,15 +309,19 @@ aws eks update-kubeconfig --name development-demo --region ap-south-1 --profile 
 kubectl --context dev get pods -A
 ```
 
-The developer IAM policy grants `s3:*` on `*`. That is convenient for a demo; tighten it for real use.
+The legacy developer IAM policy grants `s3:*` on `*` and the admin role `eks:*`; both are broader than needed.
 
-### Console
+Legacy console steps:
 
 1. *IAM → Users → Create user* (`demo-developer`, `manager`). Developer: attach a policy with `eks:DescribeCluster` and `eks:ListClusters`. Manager: attach a policy allowing `sts:AssumeRole` on the admin role.
 2. *IAM → Roles → Create role → AWS account → This account*, name `development-demo-eks-admin`, attach a policy with `eks:*` and `iam:PassRole` (condition `iam:PassedToService = eks.amazonaws.com`).
-3. *EKS → cluster → Access → IAM access entries → Create access entry*: pick the principal, type *Standard*, then either add **Kubernetes groups** `my-viewer` / `my-admin` or pick an access policy.
+3. *EKS → cluster → Access → IAM access entries → Create access entry*: pick the principal, type *Standard*, add **Kubernetes groups** `my-viewer` / `my-admin`.
 4. *IAM → Users → user → Security credentials → Create access key*.
-5. From a session that is already cluster admin, apply the two `clusterrolebinding` commands above (CloudShell works).
+5. From a session that is already cluster admin, apply the two `clusterrolebinding` commands above.
+
+Revoking in the legacy model means deleting that person's access entry (`aws_eks_access_entry.developer` / `manager_user`, or *EKS → Access → entry → Delete*). A token they already hold works for up to about 15 more minutes.
+
+> **Moving off legacy:** the newer process replaces per-person entries with group membership, removes the RBAC bindings, and gives a one-step revoke.
 
 > **No local tools?** Open **AWS CloudShell** (icon in the console top bar) and run `aws eks update-kubeconfig --name development-demo --region ap-south-1`; then `kubectl` works with your console identity. If you restrict the public API CIDRs, CloudShell must be inside them.
 
@@ -402,6 +465,7 @@ kubectl get storageclass
 | environment, region, zones, cluster name, Kubernetes version | `0-locals.tf` |
 | who may reach the API server from the internet | `api_allowed_cidrs` in `0-locals.tf` |
 | node type, size, disk, scaling | `8-nodes.tf` |
+| access model and who is in each group | `access_model`, `eks_viewer_users`, `eks_admin_users` in `0-locals.tf` |
 | AWS profile | `1-providers.tf`, `21-gateway-api-crds.tf` |
 | Helm values | `values/` |
 | Gateway API version | replace `gateway-api/standard-install.yaml` |
@@ -421,6 +485,7 @@ Core add-ons are deliberately unpinned so EKS picks the compatible default when 
 | Gateways are ignored by the controller | CRDs were installed after LBC started: restart the LBC deployment. |
 | CoreDNS add-on `Degraded` | Normal until nodes are Ready. |
 | HPA shows `<unknown>` for CPU | Metrics Server not ready, or pods have no CPU `requests`. |
+| A user can log in but every `kubectl` call is `forbidden` | Newer model: the role is missing its access policy association. Legacy model: the `clusterrolebinding` for their group was never created. |
 | `terraform destroy` hangs on subnets/VPC | Leftover load balancers, network interfaces or security groups created by LBC. See section 10. |
 
 ---
@@ -446,7 +511,7 @@ This repo is tuned for learning. Before running real workloads, work through thi
 | Restrict `api_allowed_cidrs` to your office/VPN, or disable public endpoint access | `0.0.0.0/0` exposes the API server to the internet | `0.0.0.0/0` |
 | One NAT gateway per AZ and nodes in 3 AZs | One NAT or AZ is a single point of failure | 1 NAT, 2 AZs |
 | Set `bootstrap_cluster_creator_admin_permissions = false` and grant admin to a named role | Avoid a hidden permanent admin | `true` |
-| Replace broad IAM: `s3:*` on `*` (developer), `eks:*` (admin role) | Least privilege | broad |
+| Keep the newer access model (groups + roles, no per-person entries); add MFA (`aws:MultiFactorAuthPresent`) to the role trust policies | Easy audit and revoke | newer model is the default; MFA not set. The legacy model has broad `s3:*` / `eks:*` |
 | Kubernetes NetworkPolicies (VPC CNI supports them) and Pod Security Standards (`restricted`) | Pods can currently talk to every pod and run privileged | none |
 | Keep IMDSv2 with hop limit 1 so pods cannot steal node credentials | Standard EKS hardening | already set |
 | Use Pod Identity per workload, not the node role, for AWS access | Blast radius | used for all controllers |
@@ -476,7 +541,7 @@ This repo is tuned for learning. Before running real workloads, work through thi
 | Metrics and alerts: Amazon Managed Prometheus/Grafana, Container Insights or kube-prometheus-stack | You only learn about problems from users otherwise | Metrics Server only |
 | Application logs to CloudWatch or Loki; keep the 14-day control-plane log retention | Debugging and audit | control-plane logs only |
 | Tag everything and set an AWS Budget and billing alarm | A forgotten NAT gateway plus load balancers is the usual surprise bill | few tags |
-| Keep `max_size` of the node group a deliberate cost ceiling | Autoscaler followed a load test straight to 10 nodes here | 10 |
+| Keep `max_size` of the node group a deliberate cost ceiling | The autoscaler followed a load test straight to 10 nodes here | 10 |
 | Add `prevent_destroy` or deletion protection on data (EFS, load balancers) | Accidents | none |
 
 A reasonable order: remote state → restrict API access → HTTPS → least-privilege IAM → backups → observability → multi-AZ NAT and replicas.
@@ -491,9 +556,9 @@ terraform destroy -target=helm_release.external_nginx    # releases the NLB
 terraform destroy
 ```
 
-If destroy fails on the VPC, look in *EC2 → Load Balancers*, *EC2 → Network Interfaces* and *EC2 → Security Groups* for leftovers named `k8s-…` and delete them, then run `terraform destroy` again.
+If destroy fails on the VPC, look in *EC2 → Load Balancers*, *EC2 → Network Interfaces* and *EC2 → Security Groups* for leftovers named `k8s-…` and delete them, then run `terraform destroy` again. If you created access keys for the demo users, delete them first (`aws iam delete-access-key`), or destroying the IAM users fails.
 
-**Console:** delete the load balancers; then *EC2 → Auto Scaling groups* (set desired capacity to 0, then delete); then the EKS node group and cluster; then the VPC (release the NAT gateway and its Elastic IP first, then *VPC → Delete VPC*, which removes subnets, route tables and the internet gateway); finally the IAM roles and users.
+**Console:** delete the load balancers; then *EC2 → Auto Scaling groups* (set desired capacity to 0, then delete); then the EKS node group and cluster; then the VPC (release the NAT gateway and its Elastic IP first, then *VPC → Delete VPC*, which removes subnets, route tables and the internet gateway); finally the IAM roles, groups and users.
 
 ## License
 
