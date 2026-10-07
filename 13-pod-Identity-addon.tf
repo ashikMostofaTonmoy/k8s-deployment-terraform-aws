@@ -3,5 +3,5 @@ resource "aws_eks_addon" "pod_identity" {
   addon_name   = "eks-pod-identity-agent"
 
   # DaemonSet: needs nodes before it can become ACTIVE.
-  depends_on = [aws_eks_node_group.general]
+  depends_on = [aws_autoscaling_group.nodes]
 }

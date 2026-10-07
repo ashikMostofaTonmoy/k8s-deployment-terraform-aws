@@ -24,5 +24,5 @@ resource "aws_eks_addon" "coredns" {
   resolve_conflicts_on_create = "OVERWRITE"
   resolve_conflicts_on_update = "PRESERVE"
 
-  depends_on = [aws_eks_node_group.general]
+  depends_on = [aws_autoscaling_group.nodes]
 }

@@ -75,7 +75,7 @@ resource "helm_release" "efs_csi_driver" {
     # Its pods have nowhere to schedule until the node group exists; without
     # this the release installs, fails, and blocks the next apply with
     # "cannot re-use a name that is still in use".
-    aws_eks_node_group.general,
+    aws_autoscaling_group.nodes,
   ]
 }
 

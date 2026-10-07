@@ -8,5 +8,5 @@ resource "helm_release" "metrics_server" {
 
   values = [file("${path.module}/values/metrics-server.yaml")]
 
-  depends_on = [aws_eks_node_group.general]
+  depends_on = [aws_autoscaling_group.nodes]
 }
