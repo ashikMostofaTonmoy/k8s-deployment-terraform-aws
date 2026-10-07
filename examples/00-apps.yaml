@@ -1,0 +1,70 @@
+# Two versions of the argoproj rollouts-demo app (blue / yellow). Each pod
+# serves a coloured grid on :8080, so you can see which version answered.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-blue
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-blue }
+  template:
+    metadata:
+      labels: { app: demo-blue }
+    spec:
+      containers:
+        - name: app
+          image: argoproj/rollouts-demo:blue
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-blue
+  namespace: demo
+spec:
+  selector: { app: demo-blue }
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-yellow
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: demo-yellow }
+  template:
+    metadata:
+      labels: { app: demo-yellow }
+    spec:
+      containers:
+        - name: app
+          image: argoproj/rollouts-demo:yellow
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-yellow
+  namespace: demo
+spec:
+  selector: { app: demo-yellow }
+  ports:
+    - port: 80
+      targetPort: 8080

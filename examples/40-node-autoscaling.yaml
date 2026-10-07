@@ -1,0 +1,23 @@
+# Node autoscaling demo. Each pod asks for 1 CPU; a t3a.large has 2 vCPU
+# (~1.9 allocatable, minus system pods), so 8 replicas cannot fit on 2 nodes.
+# Extra pods go Pending -> Cluster Autoscaler raises the ASG desired size ->
+# new nodes join -> pods schedule. Delete this to watch nodes scale back in
+# (after ~10 min of low utilisation).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-scale-test
+  namespace: demo
+spec:
+  replicas: 8
+  selector:
+    matchLabels: { app: node-scale-test }
+  template:
+    metadata:
+      labels: { app: node-scale-test }
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.10
+          resources:
+            requests: { cpu: "1", memory: 64Mi }

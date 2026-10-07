@@ -42,7 +42,7 @@ resource "helm_release" "aws_lbc" {
   repository = "https://aws.github.io/eks-charts"
   chart      = "aws-load-balancer-controller"
   namespace  = "kube-system"
-  version    = "3.5.0"
+  version    = "3.6.0"
 
   set = [
     {
@@ -59,5 +59,8 @@ resource "helm_release" "aws_lbc" {
     },
   ]
 
-  depends_on = [helm_release.cluster_autoscaler]
+  depends_on = [
+    helm_release.cluster_autoscaler,
+    terraform_data.gateway_api_crds,
+  ]
 }
