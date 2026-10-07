@@ -39,3 +39,20 @@ kubectl get nodes -w                           # nodes removed after ~10 min unn
 Tested: 2 -> 10 nodes (the ASG max) with both demos running; after deleting the load the HPA
 returned to 1 pod and nodes fell back 10 -> 2 about 12 minutes later (the autoscaler's default
 10-minute `scale-down-unneeded-time`, plus a few minutes to drain).
+
+## Capacity types (On-Demand vs Spot)
+
+`50-capacity-types.yaml` runs one pod on `capacity: on-demand` nodes and one on `capacity: spot` nodes
+using `nodeSelector`. It works with the self-managed groups (`8-nodes.tf`) and with the managed node groups
+(`8a-managed-nodes.tf`), since both set the same label.
+
+```
+kubectl get nodes -L capacity,role
+kubectl apply -f examples/50-capacity-types.yaml
+kubectl -n demo get pods -o wide    # which node each pod landed on
+```
+
+The spot pod stays `Pending` until a Spot node group is enabled (`-var enable_spot_nodes=true` or
+`-var enable_managed_node_groups=true`). Tested: the on-demand pod scheduled on the On-Demand node; the
+Spot half could not be tested because this account cannot launch Spot instances.
+

@@ -68,6 +68,36 @@ resource "aws_eks_access_entry" "nodes" {
   type          = "EC2_LINUX"
 }
 
+locals {
+  # One user-data document per capacity type; only the node label differs, so
+  # pods can pick a pool with nodeSelector `capacity: on-demand | spot`.
+  node_user_data = {
+    for capacity in ["on-demand", "spot"] : capacity => base64encode(<<-EOT
+      MIME-Version: 1.0
+      Content-Type: multipart/mixed; boundary="//"
+
+      --//
+      Content-Type: application/node.eks.aws
+
+      ---
+      apiVersion: node.eks.aws/v1alpha1
+      kind: NodeConfig
+      spec:
+        cluster:
+          name: ${aws_eks_cluster.eks.name}
+          apiServerEndpoint: ${aws_eks_cluster.eks.endpoint}
+          certificateAuthority: ${aws_eks_cluster.eks.certificate_authority[0].data}
+          cidr: ${aws_eks_cluster.eks.kubernetes_network_config[0].service_ipv4_cidr}
+        kubelet:
+          flags:
+            - --node-labels=role=general,capacity=${capacity}
+
+      --//--
+    EOT
+    )
+  }
+}
+
 resource "aws_launch_template" "nodes" {
   name_prefix   = "${local.env}-${local.eks_name}-general-"
   image_id      = data.aws_ami.eks_node.id
@@ -102,29 +132,7 @@ resource "aws_launch_template" "nodes" {
 
   # AL2023 boots through nodeadm, which needs the cluster details up front --
   # it deliberately does not call DescribeCluster the way AL2 did.
-  user_data = base64encode(<<-EOT
-    MIME-Version: 1.0
-    Content-Type: multipart/mixed; boundary="//"
-
-    --//
-    Content-Type: application/node.eks.aws
-
-    ---
-    apiVersion: node.eks.aws/v1alpha1
-    kind: NodeConfig
-    spec:
-      cluster:
-        name: ${aws_eks_cluster.eks.name}
-        apiServerEndpoint: ${aws_eks_cluster.eks.endpoint}
-        certificateAuthority: ${aws_eks_cluster.eks.certificate_authority[0].data}
-        cidr: ${aws_eks_cluster.eks.kubernetes_network_config[0].service_ipv4_cidr}
-      kubelet:
-        flags:
-          - --node-labels=role=general
-
-    --//--
-  EOT
-  )
+  user_data = local.node_user_data["on-demand"]
 
   tag_specifications {
     resource_type = "instance"
@@ -147,7 +155,7 @@ resource "aws_autoscaling_group" "nodes" {
     aws_subnet.private_zone2.id
   ]
 
-  desired_capacity = 2
+  desired_capacity = 1
   max_size         = 10
   min_size         = 0
 
@@ -185,6 +193,122 @@ resource "aws_autoscaling_group" "nodes" {
   ]
 
   # Allow cluster-autoscaler to change this without a plan difference
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
+}
+
+# ---------------------------------------------------------------------------
+# SPOT NODE GROUP
+#
+# Same recipe, but the launch template asks for Spot capacity. Spot is up to
+# ~70% cheaper, but AWS can reclaim the instance with 2 minutes' notice, so run
+# only interruption-tolerant pods here (pick it with nodeSelector capacity=spot).
+# Still no mixed_instances_policy: that would route through CreateFleet.
+#
+# Off by default (enable_spot_nodes). Some accounts have no Spot capacity
+# until AWS raises the limit: launches fail with "Max spot instance count
+# exceeded" even though Service Quotas shows 32. Test with:
+#   aws ec2 run-instances ... --instance-market-options MarketType=spot
+# ---------------------------------------------------------------------------
+
+resource "aws_launch_template" "spot" {
+  count = var.enable_spot_nodes ? 1 : 0
+
+  name_prefix   = "${local.env}-${local.eks_name}-spot-"
+  image_id      = data.aws_ami.eks_node.id
+  instance_type = "t3a.large"
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.nodes.arn
+  }
+
+  vpc_security_group_ids = [aws_eks_cluster.eks.vpc_config[0].cluster_security_group_id]
+
+  instance_market_options {
+    market_type = "spot"
+
+    spot_options {
+      spot_instance_type = "one-time"
+    }
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      volume_size           = 100
+      volume_type           = "gp3"
+      delete_on_termination = true
+      encrypted             = true
+    }
+  }
+
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+    http_endpoint               = "enabled"
+  }
+
+  user_data = local.node_user_data["spot"]
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = {
+      Name = "${local.env}-${local.eks_name}-spot"
+    }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "spot" {
+  count = var.enable_spot_nodes ? 1 : 0
+
+  name_prefix = "${local.env}-${local.eks_name}-spot-"
+
+  vpc_zone_identifier = [
+    aws_subnet.private_zone1.id,
+    aws_subnet.private_zone2.id
+  ]
+
+  desired_capacity = 1
+  max_size         = 5
+  min_size         = 0
+
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
+
+  launch_template {
+    id      = aws_launch_template.spot[0].id
+    version = aws_launch_template.spot[0].latest_version
+  }
+
+  dynamic "tag" {
+    for_each = {
+      "Name"                                                  = "${local.env}-${local.eks_name}-spot"
+      "kubernetes.io/cluster/${aws_eks_cluster.eks.name}"     = "owned"
+      "k8s.io/cluster-autoscaler/enabled"                     = "true"
+      "k8s.io/cluster-autoscaler/${aws_eks_cluster.eks.name}" = "owned"
+    }
+
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.nodes,
+    aws_eks_access_entry.nodes,
+    aws_eks_addon.vpc_cni,
+    aws_eks_addon.kube_proxy,
+  ]
+
   lifecycle {
     ignore_changes = [desired_capacity]
   }

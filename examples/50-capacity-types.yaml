@@ -1,0 +1,50 @@
+# Pick a node pool with nodeSelector. Requires the label set in 8-nodes.tf
+# (capacity=on-demand | spot). Works with either kind of node group:
+#   - self-managed Spot group: terraform apply -var enable_spot_nodes=true
+#   - EKS managed groups (On-Demand + Spot): -var enable_managed_node_groups=true
+# The spot pod stays Pending until one of those provides a spot node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: on-demand-app
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: on-demand-app }
+  template:
+    metadata:
+      labels: { app: on-demand-app }
+    spec:
+      nodeSelector:
+        capacity: on-demand
+      containers:
+        - name: app
+          image: argoproj/rollouts-demo:green
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spot-app
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: spot-app }
+  template:
+    metadata:
+      labels: { app: spot-app }
+    spec:
+      nodeSelector:
+        capacity: spot
+      containers:
+        - name: app
+          image: argoproj/rollouts-demo:purple
+          ports:
+            - containerPort: 8080
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }

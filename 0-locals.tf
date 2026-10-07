@@ -40,3 +40,15 @@ locals {
 }
 
 data "aws_caller_identity" "current" {}
+
+variable "enable_spot_nodes" {
+  description = "Also create a Spot node group (1 node) next to the On-Demand one. Needs Spot capacity in the account."
+  type        = bool
+  default     = false
+}
+
+variable "enable_managed_node_groups" {
+  description = "Also create EKS managed node groups (On-Demand + Spot, 1 node each). Needs the EC2 Fleet API and Spot capacity in the account."
+  type        = bool
+  default     = false
+}

@@ -77,7 +77,7 @@ Key ideas, in plain words:
 | Network | VPC `10.0.0.0/16`, 2 public + 2 private subnets, internet gateway, 1 NAT gateway, route tables | `2-vpc.tf` .. `6-routes.tf` |
 | Control plane | EKS cluster (API auth mode), IAM role, CloudWatch log group (14-day retention) | `7-eks.tf` |
 | Core add-ons | `vpc-cni`, `kube-proxy`, `coredns` (EKS add-ons) | `7a-core-addons.tf` |
-| Nodes | Launch template + Auto Scaling group (2 x `t3a.large`, Amazon Linux 2023), access entry, instance profile | `8-nodes.tf` |
+| Nodes | Launch template + Auto Scaling group (On-Demand, 1 x `t3a.large`), optional Spot group (1 node), access entry, instance profile; optional EKS managed node groups | `8-nodes.tf`, `8a-managed-nodes.tf` |
 | Access | IAM groups → IAM roles → EKS access policies (newer, default); IAM users → Kubernetes groups (older, `access_model = "legacy"`) | `11-` (newer); `9-`, `10-` (older) |
 | Platform | Metrics Server, Pod Identity Agent, Cluster Autoscaler | `12-`, `13-`, `14-` |
 | Traffic | AWS Load Balancer Controller, ingress-nginx (NLB), Gateway API CRDs, cert-manager | `15-` .. `17-`, `21-` |
@@ -99,7 +99,7 @@ There are two ways to run nodes on EKS. This repo implements **B**, which works 
 
 **Why B here:** some AWS accounts (commonly new or restricted ones) cannot call the EC2 **Fleet** API. Managed node groups always launch through Fleet, so they sit in `CREATING` forever and the Auto Scaling group reports *"You've reached your quota for maximum Fleet Requests for this account"*. A plain Auto Scaling group with a launch template does not use Fleet, so it works. Fixing the account limit requires an AWS Support case.
 
-To switch to A when your account allows it, replace the launch template, ASG and access entry in `8-nodes.tf` with:
+Option A is already written for you in `8a-managed-nodes.tf` (On-Demand + Spot, 1 node each, same `capacity` labels). Turn it on with `terraform apply -var enable_managed_node_groups=true`; it is off by default because it hangs in accounts without EC2 Fleet. To use A *instead of* B, enable it and set `desired_capacity` of the groups in `8-nodes.tf` to 0 (or delete them). The core of it, if you want to write your own:
 
 ```hcl
 resource "aws_eks_node_group" "general" {
@@ -125,6 +125,30 @@ Self-managed nodes (B) need three things that a managed node group does automati
 1. an **EKS access entry** of type `EC2_LINUX` for the node IAM role (otherwise the kubelet cannot authenticate);
 2. the **cluster security group** attached to the launch template (otherwise nodes cannot reach the API server's private endpoint);
 3. a `NodeConfig` in the user data holding the cluster name, endpoint, CA and service CIDR (Amazon Linux 2023 does not look these up itself).
+
+### On-Demand and Spot node groups
+
+`8-nodes.tf` defines two node groups of one node each, so you can show both capacity types:
+
+| | On-Demand group (default, on) | Spot group (`enable_spot_nodes`, off by default) |
+|---|---|---|
+| Node label | `capacity=on-demand` | `capacity=spot` |
+| Price | full price, never reclaimed | up to ~70% cheaper, AWS can take it back with 2 minutes' notice |
+| Use for | databases, anything that must stay up | stateless, restartable work (batch, workers, dev) |
+| Max nodes | 10 | 5 |
+
+Both groups are tagged for the Cluster Autoscaler, so each scales on its own. Pods choose a pool with `nodeSelector` (see `examples/50-capacity-types.yaml`):
+
+```bash
+terraform apply -var enable_spot_nodes=true     # adds the Spot group
+kubectl get nodes -L capacity,role
+kubectl apply -f examples/50-capacity-types.yaml
+kubectl -n demo get pods -o wide                # on-demand-app and spot-app on different nodes
+```
+
+The Spot group is a plain Auto Scaling group whose launch template requests Spot (`instance_market_options`), with no `mixed_instances_policy`, so it avoids the EC2 Fleet API. **It still needs Spot capacity in your account.** Some new accounts get `Max spot instance count exceeded` on every Spot request even though Service Quotas shows a normal value (the author's account did, which is why it is off by default); the fix is an AWS Support case. You can test an account with `aws ec2 run-instances --instance-market-options MarketType=spot ...`. The managed-node-group equivalent is already written in `8a-managed-nodes.tf` (`capacity_type = "SPOT"` with three instance types); enable it with `-var enable_managed_node_groups=true` in an account where EC2 Fleet and Spot both work. The `capacity` labels are identical, so the same `nodeSelector` examples work for both kinds.
+
+Console: *EC2 → Launch templates → Create* as in section 1, then under *Advanced details → Purchasing option* tick **Request Spot Instances**, and use `--node-labels=role=general,capacity=spot` in the user data.
 
 ## Before you start
 
@@ -161,7 +185,7 @@ Connect and check:
 
 ```bash
 aws eks update-kubeconfig --region ap-south-1 --name development-demo --profile <your-profile> --alias development-demo
-kubectl get nodes          # 2 nodes, STATUS Ready
+kubectl get nodes          # 1 node (2 with Spot enabled), STATUS Ready
 kubectl get pods -A        # everything Running
 ```
 
@@ -464,7 +488,7 @@ kubectl get storageclass
 |---|---|
 | environment, region, zones, cluster name, Kubernetes version | `0-locals.tf` |
 | who may reach the API server from the internet | `api_allowed_cidrs` in `0-locals.tf` |
-| node type, size, disk, scaling | `8-nodes.tf` |
+| node type, size, disk, scaling; self-managed Spot group on/off; managed node groups on/off | `8-nodes.tf`, `8a-managed-nodes.tf`; `enable_spot_nodes`, `enable_managed_node_groups` in `0-locals.tf` |
 | access model and who is in each group | `access_model`, `eks_viewer_users`, `eks_admin_users` in `0-locals.tf` |
 | AWS profile | `1-providers.tf`, `21-gateway-api-crds.tf` |
 | Helm values | `values/` |
@@ -521,7 +545,7 @@ This repo is tuned for learning. Before running real workloads, work through thi
 | Do this | Why | In repo |
 |---|---|---|
 | Run at least 2 replicas of every important app, spread across zones (`topologySpreadConstraints`) and add PodDisruptionBudgets | Node drains and autoscaler scale-in otherwise cause downtime | demo apps only |
-| Mix instance types and use On-Demand for critical pods, Spot for the rest | Capacity and cost; **note**: mixed/Spot groups need EC2 Fleet | single type, On-Demand |
+| Run critical pods On-Demand and tolerant ones on Spot, with several instance types per Spot pool | Capacity and cost; mixed-instance groups need EC2 Fleet | On-Demand plus an optional single-type Spot group |
 | Patch nodes on a schedule: new AMI, then an Auto Scaling *instance refresh* | Self-managed nodes are not patched for you | manual |
 | Back up persistent data (EBS snapshots, EFS backup, Velero for cluster objects) | `terraform destroy` or a bad deploy loses data | none |
 | Set resource `requests`/`limits` and a `LimitRange`/`ResourceQuota` per namespace | Autoscalers and the scheduler depend on requests | demo apps only |
